@@ -625,6 +625,21 @@ async function ensureContentScript(tabId, allFrames) {
   }, cb));
 }
 
+function isMainFrame(frameId) {
+  return !Number.isInteger(frameId) || frameId === 0;
+}
+
+async function ensureContentScriptInFrame(tabId, frameId) {
+  if (isMainFrame(frameId)) {
+    await ensureContentScript(tabId, false);
+    return;
+  }
+  await callbackApi((cb) => chrome.scripting.executeScript({
+    target: {tabId, frameIds: [frameId]},
+    files: ["content.js"],
+  }, cb));
+}
+
 async function getFrames(tabId) {
   try {
     const frames = await callbackApi((cb) => chrome.webNavigation.getAllFrames({tabId}, cb));
@@ -658,6 +673,29 @@ async function sendContentMessage(tabId, frameId, command, payload) {
   return response;
 }
 
+function isMissingContentReceiverError(error) {
+  return error && /Receiving end does not exist/i.test(error.message || String(error));
+}
+
+async function sendContentMessageWithInjectedFrame(tabId, frameId, command, payload) {
+  try {
+    return await sendContentMessage(tabId, frameId, command, payload);
+  } catch (error) {
+    if (!isMissingContentReceiverError(error)) {
+      throw error;
+    }
+    try {
+      await ensureContentScriptInFrame(tabId, frameId);
+    } catch (injectError) {
+      throw new Error(
+        `Content script receiver was missing in frame ${isMainFrame(frameId) ? 0 : frameId}, ` +
+        `and reinjection failed: ${injectError.message || String(injectError)}`
+      );
+    }
+    return sendContentMessage(tabId, frameId, command, payload);
+  }
+}
+
 async function snapshotTab(tabId, payload) {
   const contentSnapshot = await collectContentSnapshot(tabId, payload);
   const cdpSnapshot = await collectCdpSnapshot(tabId);
@@ -670,11 +708,20 @@ async function collectContentSnapshot(tabId, payload) {
   const frames = await getFrames(tabId);
   const frameResults = [];
   for (const frame of frames) {
-    const result = await sendContentMessage(tabId, frame.frameId, "snapshot", {
-      ...payload,
-      frameId: frame.frameId,
-      frameUrl: frame.url || "",
-    });
+    let result;
+    try {
+      result = await sendContentMessageWithInjectedFrame(tabId, frame.frameId, "snapshot", {
+        ...payload,
+        frameId: frame.frameId,
+        frameUrl: frame.url || "",
+      });
+    } catch (error) {
+      if (isMainFrame(frame.frameId) || !isMissingContentReceiverError(error)) {
+        throw error;
+      }
+      console.warn(`snapshot skipped frame ${frame.frameId} in tab ${tabId}: ${error.message}`);
+      continue;
+    }
     if (result) {
       frameResults.push({frame, result});
     }
@@ -700,6 +747,7 @@ async function collectCdpSnapshot(tabId) {
       axTrees.push({frameId, nodes: axTree && Array.isArray(axTree.nodes) ? axTree.nodes : []});
     }
     const domSnapshot = await debuggerSendCommand(tabId, "DOMSnapshot.captureSnapshot", {
+      computedStyles: [],
       includePaintOrder: true,
       includeDOMRects: true,
       includeBlendedBackgroundColors: false,
