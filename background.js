@@ -358,6 +358,10 @@ async function executeCommand(command, payload) {
     return runTargetedCommand(await getControlledTabId(), "type", payload);
   case "press":
     return runTargetedCommand(await getControlledTabId(), "press", payload);
+  case "actions":
+    return runTargetedCommand(await getControlledTabId(), "actions", payload);
+  case "dragAndDrop":
+    return runTargetedCommand(await getControlledTabId(), "dragAndDrop", payload);
   case "playMedia":
     return runTargetedCommand(await getControlledTabId(), "playMedia", payload);
   case "mediaState":
@@ -1388,6 +1392,20 @@ async function runTargetedCommand(tabId, command, payload) {
     await ensureContentScript(tabId, false);
   }
 
+  if (command === "actions") {
+    const prepared = resolveActionStepsPayload(tabId, payload);
+    const result = await sendPreparedContentCommand(tabId, command, prepared, payload);
+    await settleTab(tabId);
+    return result;
+  }
+
+  if (command === "dragAndDrop") {
+    const prepared = resolveDragPayload(tabId, payload);
+    const result = await sendPreparedContentCommand(tabId, command, prepared, payload);
+    await settleTab(tabId);
+    return result;
+  }
+
   const target = resolveSnapshotTarget(tabId, payload);
   const framedPayload = {...payload};
   if (target) {
@@ -1450,8 +1468,123 @@ function isNavigationInterruptedMessage(error) {
   return /message channel closed|receiving end does not exist/i.test(errorMessage(error));
 }
 
-function canCommandNavigate(command) {
-  return command === "click" || command === "press";
+function canCommandNavigate(command, payload) {
+  if (command === "click" || command === "press") {
+    return true;
+  }
+  if (command !== "actions" || !payload || !Array.isArray(payload.steps)) {
+    return false;
+  }
+  return payload.steps.some((step) => step && ["click", "press"].includes(String(step.kind || "")));
+}
+
+async function sendPreparedContentCommand(tabId, command, prepared, originalPayload) {
+  if (Number.isInteger(prepared.frameId)) {
+    try {
+      return await sendContentMessageWithInjectedFrame(tabId, prepared.frameId, command, prepared.payload);
+    } catch (error) {
+      if (isNavigationInterruptedMessage(error) && canCommandNavigate(command, originalPayload)) {
+        await settleTab(tabId);
+        return {ok: true, navigationInterruptedResponse: true};
+      }
+      throw error;
+    }
+  }
+  try {
+    return await sendContentMessageWithInjectedFrame(tabId, 0, command, prepared.payload);
+  } catch (firstError) {
+    if (isNavigationInterruptedMessage(firstError) && canCommandNavigate(command, originalPayload)) {
+      await settleTab(tabId);
+      return {ok: true, navigationInterruptedResponse: true};
+    }
+    if (!hasSelectorLocator(originalPayload)) {
+      throw firstError;
+    }
+    const frames = await getFrames(tabId);
+    for (const frame of frames) {
+      if (frame.frameId === 0) {
+        continue;
+      }
+      try {
+        return await sendContentMessageWithInjectedFrame(tabId, frame.frameId, command, prepared.payload);
+      } catch (error) {
+        if (isNavigationInterruptedMessage(error) && canCommandNavigate(command, originalPayload)) {
+          await settleTab(tabId);
+          return {ok: true, navigationInterruptedResponse: true};
+        }
+        // Try the next frame.
+      }
+    }
+    throw firstError;
+  }
+}
+
+function hasSelectorLocator(payload) {
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+  if (payload.selector || payload.sourceSelector || payload.targetSelector) {
+    return true;
+  }
+  if (!Array.isArray(payload.steps)) {
+    return false;
+  }
+  return payload.steps.some((step) => step && step.selector);
+}
+
+function resolveActionStepsPayload(tabId, payload) {
+  const steps = Array.isArray(payload && payload.steps) ? payload.steps : [];
+  const resolvedSteps = [];
+  let frameId;
+  for (const rawStep of steps) {
+    const step = {...rawStep};
+    if (step.index) {
+      const target = resolveSnapshotTarget(tabId, {index: step.index});
+      if (Number.isInteger(target.frameId)) {
+        if (frameId !== undefined && frameId !== target.frameId) {
+          throw new Error("browser_use_actions cannot mix indexed elements from multiple frames in one call");
+        }
+        frameId = target.frameId;
+      }
+      if (target.selector) {
+        step.selector = target.selector;
+      } else {
+        step.ref = target.ref;
+      }
+      delete step.index;
+    }
+    resolvedSteps.push(step);
+  }
+  return {frameId, payload: {...payload, steps: resolvedSteps}};
+}
+
+function resolveDragPayload(tabId, payload) {
+  const out = {...payload};
+  let frameId;
+  if (payload && payload.sourceIndex) {
+    const source = resolveSnapshotTarget(tabId, {index: payload.sourceIndex});
+    frameId = source.frameId;
+    if (source.selector) {
+      out.sourceSelector = source.selector;
+    } else {
+      out.sourceRef = source.ref;
+    }
+    delete out.sourceIndex;
+  }
+  if (payload && payload.targetIndex) {
+    const target = resolveSnapshotTarget(tabId, {index: payload.targetIndex});
+    if (frameId !== undefined && target.frameId !== frameId) {
+      throw new Error("browser_use_drag_and_drop cannot drag between indexed elements in different frames");
+    }
+    frameId = target.frameId;
+    if (target.selector) {
+      out.targetSelector = target.selector;
+    } else {
+      out.targetRef = target.ref;
+    }
+    delete out.targetIndex;
+  }
+  return {frameId, payload: out};
 }
 
 async function resolveClickPoint(tabId, payload) {

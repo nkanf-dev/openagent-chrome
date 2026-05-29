@@ -35,6 +35,10 @@
       return typeIntoElement(payload);
     case "press":
       return pressKey(payload);
+    case "actions":
+      return runActions(payload);
+    case "dragAndDrop":
+      return dragAndDrop(payload);
     case "playMedia":
       return playMedia();
     case "mediaState":
@@ -506,17 +510,195 @@
     };
     el.dispatchEvent(new MouseEvent("mouseover", eventOptions));
     el.dispatchEvent(new MouseEvent("mousemove", eventOptions));
-    el.dispatchEvent(new MouseEvent("mousedown", eventOptions));
-    el.dispatchEvent(new MouseEvent("mouseup", eventOptions));
     if (payload.doubleClick) {
-      el.dispatchEvent(new MouseEvent("dblclick", eventOptions));
+      dispatchClickSequence(el, eventOptions, 1);
+      dispatchClickSequence(el, eventOptions, 2);
+      el.dispatchEvent(new MouseEvent("dblclick", {...eventOptions, detail: 2}));
     } else if (eventOptions.button === 2) {
+      el.dispatchEvent(new MouseEvent("mousedown", eventOptions));
+      el.dispatchEvent(new MouseEvent("mouseup", eventOptions));
       el.dispatchEvent(new MouseEvent("contextmenu", eventOptions));
     } else {
+      el.dispatchEvent(new MouseEvent("mousedown", eventOptions));
+      el.dispatchEvent(new MouseEvent("mouseup", eventOptions));
       el.click();
     }
     await sleep(250);
     return {clicked: true, tag: tagName(el), text: accessibleText(el).slice(0, 120)};
+  }
+
+  function dispatchClickSequence(el, eventOptions, detail) {
+    const options = {...eventOptions, detail};
+    el.dispatchEvent(new MouseEvent("mousedown", options));
+    el.dispatchEvent(new MouseEvent("mouseup", options));
+    el.dispatchEvent(new MouseEvent("click", options));
+  }
+
+  async function runActions(payload) {
+    const steps = Array.isArray(payload.steps) ? payload.steps : [];
+    if (steps.length === 0) {
+      throw new Error("steps must contain at least one action");
+    }
+    const results = [];
+    for (let i = 0; i < steps.length; i += 1) {
+      const step = steps[i] || {};
+      const kind = String(step.kind || "").trim();
+      try {
+        let result;
+        if (kind === "click" && i + 1 < steps.length && equivalentClickSteps(step, steps[i + 1])) {
+          result = await clickElement({...step, doubleClick: true});
+          results.push({step: i + 1, kind, result});
+          results.push({step: i + 2, kind: "click", result: {doubleClick: true}});
+          i += 1;
+          continue;
+        } else if (kind === "click") {
+          result = await clickElement(step);
+        } else if (kind === "type") {
+          result = await typeIntoElement(step);
+        } else if (kind === "press") {
+          result = await pressKey(step);
+        } else {
+          throw new Error(`unsupported kind ${JSON.stringify(kind)}`);
+        }
+        results.push({step: i + 1, kind, result});
+      } catch (error) {
+        throw new Error(`step ${i + 1} ${kind || "unknown"} failed: ${error.message || String(error)}`);
+      }
+    }
+    return {ok: true, steps: results};
+  }
+
+  function equivalentClickSteps(first, second) {
+    if (!first || !second || first.kind !== "click" || second.kind !== "click") {
+      return false;
+    }
+    return String(first.selector || "") === String(second.selector || "") &&
+      String(first.index || first.ref || "") === String(second.index || second.ref || "");
+  }
+
+  async function dragAndDrop(payload) {
+    const source = resolveTarget({
+      index: payload.sourceIndex,
+      ref: payload.sourceRef,
+      selector: payload.sourceSelector,
+    });
+    const target = resolveTarget({
+      index: payload.targetIndex,
+      ref: payload.targetRef,
+      selector: payload.targetSelector,
+    });
+    source.scrollIntoView({block: "center", inline: "center"});
+    target.scrollIntoView({block: "center", inline: "center"});
+    await sleep(80);
+
+    const sourcePoint = elementCenter(source);
+    const targetPoint = elementCenter(target);
+    const dataTransfer = createDataTransfer();
+    dispatchPointerMouse(source, "mouseover", sourcePoint);
+    dispatchPointerMouse(source, "mousemove", sourcePoint);
+    dispatchPointerMouse(source, "mousedown", sourcePoint);
+    dispatchDrag(source, "dragstart", sourcePoint, dataTransfer);
+    dispatchDrag(source, "drag", sourcePoint, dataTransfer);
+
+    const moves = 8;
+    for (let i = 1; i <= moves; i += 1) {
+      const ratio = i / moves;
+      const point = {
+        x: sourcePoint.x + (targetPoint.x - sourcePoint.x) * ratio,
+        y: sourcePoint.y + (targetPoint.y - sourcePoint.y) * ratio,
+      };
+      dispatchPointerMouse(document.elementFromPoint(point.x, point.y) || target, "mousemove", point);
+      dispatchDrag(document.elementFromPoint(point.x, point.y) || target, "dragover", point, dataTransfer);
+      await sleep(30);
+    }
+
+    dispatchDrag(target, "drop", targetPoint, dataTransfer);
+    dispatchDrag(source, "dragend", targetPoint, dataTransfer);
+    dispatchPointerMouse(target, "mouseup", targetPoint);
+    await sleep(250);
+    return {
+      dragged: true,
+      source: accessibleText(source).slice(0, 120),
+      target: accessibleText(target).slice(0, 120),
+    };
+  }
+
+  function elementCenter(el) {
+    const rect = el.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+      throw new Error(`element has no visible box: ${accessibleText(el).slice(0, 80)}`);
+    }
+    return {
+      x: Math.round(rect.left + rect.width / 2),
+      y: Math.round(rect.top + rect.height / 2),
+    };
+  }
+
+  function createDataTransfer() {
+    try {
+      return new DataTransfer();
+    } catch (error) {
+      return {
+        data: {},
+        setData(type, value) {
+          this.data[type] = String(value);
+        },
+        getData(type) {
+          return this.data[type] || "";
+        },
+        clearData(type) {
+          if (type) {
+            delete this.data[type];
+          } else {
+            this.data = {};
+          }
+        },
+        dropEffect: "move",
+        effectAllowed: "all",
+        files: [],
+        items: [],
+        types: [],
+      };
+    }
+  }
+
+  function mouseOptions(point) {
+    return {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      button: 0,
+      buttons: 1,
+      clientX: Math.round(point.x),
+      clientY: Math.round(point.y),
+    };
+  }
+
+  function dispatchPointerMouse(el, type, point) {
+    const options = mouseOptions(point);
+    if (typeof PointerEvent === "function") {
+      el.dispatchEvent(new PointerEvent(type.replace(/^mouse/, "pointer"), {
+        ...options,
+        pointerId: 1,
+        pointerType: "mouse",
+        isPrimary: true,
+      }));
+    }
+    el.dispatchEvent(new MouseEvent(type, options));
+  }
+
+  function dispatchDrag(el, type, point, dataTransfer) {
+    const options = {
+      ...mouseOptions(point),
+      dataTransfer,
+    };
+    try {
+      el.dispatchEvent(new DragEvent(type, options));
+    } catch (error) {
+      const event = new MouseEvent(type, options);
+      Object.defineProperty(event, "dataTransfer", {value: dataTransfer});
+      el.dispatchEvent(event);
+    }
   }
 
   async function typeIntoElement(payload) {
